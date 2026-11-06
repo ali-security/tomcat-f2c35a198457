@@ -19,7 +19,6 @@ package org.apache.catalina.webresources;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -181,29 +180,19 @@ public class TestDirResourceSetLocking {
     /*
      * CVE-2024-50379 is only exploitable on a case insensitive file system, so
      * on such a file system paths that differ only in case must share a lock.
-     * On a case sensitive file system they refer to different files and must
-     * not contend.
-     *
-     * This asserts against the case sensitivity DirResourceSet actually
-     * determined for itself in initInternal(), so it holds on any host file
-     * system. The two branches are additionally covered deterministically by
-     * testLockKeyIsCaseFolded...() / testLockKeyIsNotCaseFolded...() below.
+     * Whether a DirResourceSet is case sensitive cannot be determined reliably
+     * (see DirResourceSet.getLockKey()), so the lock key is always case folded
+     * and paths that differ only in case share a lock on any file system.
      */
     @Test
-    public void testLockKeyCaseSensitivityFollowsFileSystem() throws Exception {
+    public void testLockKeyIsCaseFoldedOnAnyFileSystem() throws Exception {
         File lower = new File(tempDir, "case-test.jsp");
         Assert.assertTrue(lower.createNewFile());
 
         ResourceLock lock1 = dirResourceSet.lockForRead("/case-test.jsp");
         ResourceLock lock2 = dirResourceSet.lockForRead("/CASE-TEST.JSP");
         try {
-            if (isCaseSensitive(dirResourceSet)) {
-                Assert.assertNotSame("On a case sensitive file system paths differing only in case refer to " +
-                        "different files so they must not share a ResourceLock", lock1, lock2);
-            } else {
-                Assert.assertSame("On a case insensitive file system paths differing only in case refer to " +
-                        "the same file so they must share a ResourceLock", lock1, lock2);
-            }
+            Assert.assertSame("Paths differing only in case must share a ResourceLock", lock1, lock2);
         } finally {
             dirResourceSet.unlockForRead(lock2);
             dirResourceSet.unlockForRead(lock1);
@@ -212,16 +201,12 @@ public class TestDirResourceSetLocking {
 
 
     /*
-     * The case insensitive branch of the lock key calculation is the one that
-     * matters for CVE-2024-50379 but it cannot be reached on a case sensitive
-     * host file system, so drive it directly. Building the key is pure string
-     * manipulation and does not touch the file system, so forcing the flag is
-     * safe and deterministic on any host.
+     * The case folding of the lock key is the part that matters for
+     * CVE-2024-50379. Building the key is pure string manipulation and does not
+     * touch the file system, so this is deterministic on any host.
      */
     @Test
     public void testLockKeyIsCaseFoldedWhenFileSystemIsCaseInsensitive() throws Exception {
-        setCaseSensitive(dirResourceSet, false);
-
         // The key is normalized *and* lower cased.
         ResourceLock lock1 = dirResourceSet.lockForRead("/sub/../MiXeD.JSP");
         ResourceLock lock2 = dirResourceSet.lockForRead("/mixed.jsp");
@@ -249,24 +234,6 @@ public class TestDirResourceSetLocking {
         }
         Assert.assertTrue(acquired.await(GRANTED_MS, TimeUnit.MILLISECONDS));
         t.join(GRANTED_MS);
-    }
-
-
-    /* The complementary branch: no case folding on a case sensitive file system. */
-    @Test
-    public void testLockKeyIsNotCaseFoldedWhenFileSystemIsCaseSensitive() throws Exception {
-        setCaseSensitive(dirResourceSet, true);
-
-        ResourceLock lock1 = dirResourceSet.lockForRead("/sub/../MiXeD.JSP");
-        ResourceLock lock2 = dirResourceSet.lockForRead("/mixed.jsp");
-        try {
-            Assert.assertEquals("/MiXeD.JSP", lock1.key);
-            Assert.assertNotSame("Paths differing only in case refer to different files when the file system " +
-                    "is case sensitive so they must not share a ResourceLock", lock1, lock2);
-        } finally {
-            dirResourceSet.unlockForRead(lock2);
-            dirResourceSet.unlockForRead(lock1);
-        }
     }
 
 
@@ -511,25 +478,6 @@ public class TestDirResourceSetLocking {
         FileResource resource = new FileResource(root, "/read-only.txt", file, true, null);
         Assert.assertFalse(resource.delete());
         Assert.assertTrue(file.exists());
-    }
-
-
-    /*
-     * The case sensitivity DirResourceSet determined for itself in
-     * initInternal(). Read via reflection so that the tests assert against the
-     * value actually in use rather than re-implementing the detection.
-     */
-    private static boolean isCaseSensitive(DirResourceSet resourceSet) throws Exception {
-        Field field = DirResourceSet.class.getDeclaredField("caseSensitive");
-        field.setAccessible(true);
-        return ((Boolean) field.get(resourceSet)).booleanValue();
-    }
-
-
-    private static void setCaseSensitive(DirResourceSet resourceSet, boolean caseSensitive) throws Exception {
-        Field field = DirResourceSet.class.getDeclaredField("caseSensitive");
-        field.setAccessible(true);
-        field.set(resourceSet, Boolean.valueOf(caseSensitive));
     }
 
 
