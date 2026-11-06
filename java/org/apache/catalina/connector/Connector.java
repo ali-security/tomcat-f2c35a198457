@@ -210,6 +210,23 @@ public class Connector extends LifecycleMBeanBase  {
     protected int maxParameterCount = 10000;
 
     /**
+     * The maximum total number of parts permitted in a multipart/form-data
+     * request, in addition to maxParameterCount. 10000 by default, matching
+     * the default maxParameterCount that already bounded the number of parts,
+     * so a request with a large but legitimate number of parts is not
+     * rejected. A value of less than 0 means no limit.
+     */
+    private int maxPartCount = 10000;
+
+    /**
+     * The maximum number of header bytes permitted per part in a
+     * multipart/form-data request. 10240 by default, the fixed limit the
+     * bundled FileUpload applied before this setting existed, so no request
+     * that was accepted before is rejected. A value of -1 means no limit.
+     */
+    private int maxPartHeaderSize = 10240;
+
+    /**
      * Maximum size of a POST which will be automatically parsed by the
      * container. 2MB by default.
      */
@@ -465,6 +482,48 @@ public class Connector extends LifecycleMBeanBase  {
     public void setMaxParameterCount(int maxParameterCount) {
         this.maxParameterCount = maxParameterCount;
         setProperty("maxParameterCount", String.valueOf(maxParameterCount));
+    }
+
+
+    /**
+     * @return the maximum total number of parts permitted in a
+     * multipart/form-data request (10000 by default). A value of less than 0
+     * means no limit.
+     */
+    public int getMaxPartCount() {
+        return maxPartCount;
+    }
+
+
+    /**
+     * Set the maximum total number of parts permitted in a
+     * multipart/form-data request. A value of less than 0 means no limit.
+     *
+     * @param maxPartCount The new setting
+     */
+    public void setMaxPartCount(int maxPartCount) {
+        this.maxPartCount = maxPartCount;
+    }
+
+
+    /**
+     * @return the maximum number of header bytes permitted per part in a
+     * multipart/form-data request (10240 by default). A value of -1 means no
+     * limit.
+     */
+    public int getMaxPartHeaderSize() {
+        return maxPartHeaderSize;
+    }
+
+
+    /**
+     * Set the maximum number of header bytes permitted per part in a
+     * multipart/form-data request. A value of -1 means no limit.
+     *
+     * @param maxPartHeaderSize The new setting
+     */
+    public void setMaxPartHeaderSize(int maxPartHeaderSize) {
+        this.maxPartHeaderSize = maxPartHeaderSize;
     }
 
 
