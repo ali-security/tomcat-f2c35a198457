@@ -26,6 +26,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Properties;
 
 import org.apache.catalina.LifecycleException;
@@ -392,9 +393,20 @@ public class JDBCRealm
         }
 
         // Validate the user's credentials
-        boolean validated = getCredentialHandler().matches(credentials, dbCredentials);
+        boolean authenticationSuccess = getCredentialHandler().matches(credentials, dbCredentials);
 
-        if (validated) {
+        ArrayList<String> roles = null;
+
+        if (authenticationSuccess) {
+            // Obtain the roles
+            roles = getRoles(username);
+            if (roles == null) {
+                // Role lookup failed so fail authentication
+                authenticationSuccess = false;
+            }
+        }
+
+        if (authenticationSuccess) {
             if (containerLog.isTraceEnabled())
                 containerLog.trace(sm.getString("jdbcRealm.authenticateSuccess",
                                                 username));
@@ -404,8 +416,6 @@ public class JDBCRealm
                                                 username));
             return null;
         }
-
-        ArrayList<String> roles = getRoles(username);
 
         // Create and return a suitable Principal for this user
         return new GenericPrincipal(username, credentials, roles);
@@ -552,6 +562,39 @@ public class JDBCRealm
         return null;
     }
 
+
+    /**
+     * Confirms if the given user exists in the database.
+     *
+     * @param username     Username to check
+     *
+     * @return {@code true} if the user exists, otherwise {@code false}
+     */
+    protected boolean validateUser(String username) {
+        // Use the credentials lookup as a proxy for whether the user exists
+        try {
+            // Ensure that we have an open database connection
+            open();
+
+            PreparedStatement stmt = credentials(dbConnection, username);
+            try (ResultSet rs = stmt.executeQuery()) {
+                if (rs.next()) {
+                    return true;
+                }
+            }
+        } catch (SQLException e) {
+            containerLog.error(sm.getString("jdbcRealm.exception"), e);
+        }
+
+        // Close the connection so that it gets reopened next time
+        if (dbConnection != null) {
+            close(dbConnection);
+        }
+
+        return false;
+    }
+
+
     /**
      * Get the principal associated with the specified user.
      * @param username The user name
@@ -559,25 +602,31 @@ public class JDBCRealm
      */
     @Override
     protected synchronized Principal getPrincipal(String username) {
+        if (!validateUser(username)) {
+            return null;
+        }
+        List<String> roles = getRoles(username);
+        if (roles == null) {
+            return null;
+        }
 
-        return new GenericPrincipal(username,
-                                     getPassword(username),
-                                     getRoles(username));
+        String password = getPassword(username);
 
+        return new GenericPrincipal(username, password, roles);
     }
 
 
     /**
      * Return the roles associated with the given user name.
      * @param username The user name
-     * @return an array list of the role names
+     * @return an array list of the role names or {@code null} if the lookup fails
      */
     protected ArrayList<String> getRoles(String username) {
 
         if (allRolesMode != AllRolesMode.STRICT_MODE && !isRoleStoreDefined()) {
             // Using an authentication only configuration and no role store has
             // been defined so don't spend cycles looking
-            return null;
+            return new ArrayList<>(0);
         }
 
         // Number of tries is the number of attempts to connect to the database
