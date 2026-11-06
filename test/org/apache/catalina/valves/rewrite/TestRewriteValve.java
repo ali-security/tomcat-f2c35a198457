@@ -36,12 +36,18 @@ import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.catalina.Context;
+import org.apache.catalina.authenticator.BasicAuthenticator;
 import org.apache.catalina.servlets.DefaultServlet;
+import org.apache.catalina.startup.TesterMapRealm;
 import org.apache.catalina.startup.TesterServlet;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
 import org.apache.juli.logging.LogFactory;
 import org.apache.tomcat.util.buf.ByteChunk;
+import org.apache.tomcat.util.buf.UDecoder;
+import org.apache.tomcat.util.descriptor.web.LoginConfig;
+import org.apache.tomcat.util.descriptor.web.SecurityCollection;
+import org.apache.tomcat.util.descriptor.web.SecurityConstraint;
 
 /*
  * Implementation note:
@@ -61,7 +67,7 @@ public class TestRewriteValve extends TomcatBaseTest {
 
     @Test
     public void testBackslashPercentSign() throws Exception {
-        doTestRewrite("RewriteRule ^(.*) /a/\\%5A", "/", "/a/%255A");
+        doTestRewrite("RewriteRule ^(.*) /a/\\%5A", "/", "/a/%5A");
     }
 
     @Test
@@ -403,18 +409,15 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testQueryStringEncoded02() throws Exception {
         /*
          * The %nn sequences taken from the query string are inserted into the
-         * (already decoded) rewritten URL as literal characters. This version
-         * of Tomcat does not have the second stage rewrite encoding introduced
-         * by the fix for CVE-2025-31651, so the '%' characters are escaped when
-         * the encoded (i.e. un-decoded) requestURI is re-created. The upstream
-         * expectation of "/z/%2e%2e%2fc%2faAbB" therefore becomes
-         * "/z/%252e%252e%252fc%252faAbB" here. The important point is that the
-         * decoded URI retains the literal "%2e%2e%2f" text, i.e. no path
-         * traversal takes place. Compare with testUtf8FlagsB which expects
-         * "/c/%C2%A1%25C2%25A1" for the same reason.
+         * (re-write encoded) rewritten URL. Since the fix for CVE-2025-31651
+         * the '%' characters are not escaped when the encoded (i.e. un-decoded)
+         * requestURI is re-created and the rewritten URL is decoded and then
+         * normalized (the order required by the fix for CVE-2025-55752). The
+         * decoded URI is therefore "/c/aAbB" which is mapped to the snoop
+         * servlet via /c/*.
          */
         doTestRewrite("RewriteCond %{QUERY_STRING} a=(.*)\nRewriteRule ^/b.*$ /z/%1 [QSD]",
-                "/b?a=%2e%2e%2fc%2faAbB", "/z/%252e%252e%252fc%252faAbB", null);
+                "/b?a=%2e%2e%2fc%2faAbB", "/z/%2e%2e%2fc%2faAbB", null);
     }
 
     /*
@@ -426,13 +429,15 @@ public class TestRewriteValve extends TomcatBaseTest {
      * by that decoding were still present in the decoded URI handed to the
      * Mapper and, from there, to the DefaultServlet.
      *
-     * This version of Tomcat pre-dates the refactoring that introduced the
-     * additional decode step (see CVE-2025-31651). Here the URL used for
-     * rewriting has already been decoded by the connector and is normalized
-     * after rewriting, and the in-memory branch of
-     * CoyoteAdapter.postParseRequest() does not decode it again. The tests
+     * Since the fix for CVE-2025-31651 the rewritten URL is %nn encoded and
+     * is decoded after rewriting. It is decoded *before* it is normalized so
+     * any ".." sequences created by the decoding are resolved before the
+     * decoded URI is used for mapping, for the /WEB-INF and /META-INF checks
+     * and for security constraints. A rewritten URL that would escape the
+     * root of the web application is rejected with a 400 response. The tests
      * below confirm no traversal is possible and act as a regression guard
-     * against a decode step being (re-)introduced after normalization.
+     * against the decoding and normalization being performed in the wrong
+     * order.
      */
     @Test
     public void testQueryStringTraversalWebInf() throws Exception {
@@ -454,14 +459,94 @@ public class TestRewriteValve extends TomcatBaseTest {
     }
 
     @Test
+    public void testQueryStringTraversalWebInfMixedCase() throws Exception {
+        doTestTraversalBlocked("/b?a=%2E%2E%2Fweb-inf%2Fweb.xml", "<web-app");
+    }
+
+    @Test
+    public void testQueryStringTraversalWebInfBackslash() throws Exception {
+        // %5c == \ which normalization converts to /
+        doTestTraversalBlocked("/b?a=%2e%2e%5cWEB-INF%5cweb.xml", "<web-app");
+    }
+
+    @Test
     public void testQueryStringTraversalStaticFile() throws Exception {
-        // The %nn sequences must not be decoded, so no resource is reachable
-        doTestTraversalBlocked("/b?a=%2e%2e%2findex.html", "Index page");
+        /*
+         * The %nn sequences are decoded and the result is normalized, so
+         * "/z/../index.html" becomes "/index.html", a valid, publicly
+         * accessible resource *inside* the web application. This is the same
+         * result as for the not encoded form (see
+         * testQueryStringTraversalNotEncodedIsNormalized) and the same
+         * decoding as testQueryStringEncoded02. The ".." never reaches the
+         * Mapper or the /WEB-INF and /META-INF checks.
+         */
+        ByteChunk res = new ByteChunk();
+        int rc = doTestTraversal("/b?a=%2e%2e%2findex.html", res);
+        Assert.assertEquals(HttpURLConnection.HTTP_OK, rc);
+        Assert.assertTrue(res.toString().contains("Index page"));
     }
 
     @Test
     public void testQueryStringTraversalStaticFileAboveRoot() throws Exception {
-        doTestTraversalBlocked("/b?a=%2e%2e%2f%2e%2e%2findex.html", "Index page");
+        // A rewritten URL that tries to escape the root is rejected
+        doTestTraversalRejected("/b?a=%2e%2e%2f%2e%2e%2findex.html");
+    }
+
+    @Test
+    public void testQueryStringTraversalStaticFileAboveRootNotEncoded() throws Exception {
+        doTestTraversalRejected("/b?a=../../index.html");
+    }
+
+    @Test
+    public void testQueryStringTraversalSecurityConstraint() throws Exception {
+        /*
+         * The security constraint for /secret/* must be applied to the
+         * decoded and normalized rewritten URL. If the ".." were not resolved
+         * the constraint would not match "/z/../secret/x" and the snoop
+         * servlet would be reached.
+         */
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        RewriteValve rewriteValve = new RewriteValve();
+        ctx.getPipeline().addValve(rewriteValve);
+        rewriteValve.setConfiguration("RewriteCond %{QUERY_STRING} a=(.*)\n" +
+                "RewriteRule ^/b.*$ /z/%1 [QSD]");
+
+        LoginConfig loginConfig = new LoginConfig();
+        loginConfig.setAuthMethod("BASIC");
+        ctx.setLoginConfig(loginConfig);
+        ctx.getPipeline().addValve(new BasicAuthenticator());
+        ctx.setRealm(new TesterMapRealm());
+
+        SecurityCollection collection = new SecurityCollection();
+        collection.addPatternDecoded("/secret/*");
+        SecurityConstraint constraint = new SecurityConstraint();
+        constraint.addAuthRole("admin");
+        constraint.addCollection(collection);
+        ctx.addConstraint(constraint);
+        ctx.addSecurityRole("admin");
+
+        Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
+        ctx.addServletMappingDecoded("/secret/*", "snoop");
+        ctx.addServletMappingDecoded("/z/*", "snoop");
+
+        tomcat.start();
+
+        // Control. The constraint protects /secret/x
+        ByteChunk res = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/secret/x", res, null);
+        Assert.assertEquals(HttpServletResponse.SC_UNAUTHORIZED, rc);
+
+        res = new ByteChunk();
+        rc = getUrl("http://localhost:" + getPort() + "/b?a=%2e%2e%2fsecret%2fx", res, null);
+        Assert.assertEquals(HttpServletResponse.SC_UNAUTHORIZED, rc);
+
+        res = new ByteChunk();
+        rc = getUrl("http://localhost:" + getPort() + "/b?a=..%2fsecret%2fx", res, null);
+        Assert.assertEquals(HttpServletResponse.SC_UNAUTHORIZED, rc);
     }
 
     @Test
@@ -498,6 +583,21 @@ public class TestRewriteValve extends TomcatBaseTest {
                 "], body [" + body + "]", body.contains(forbiddenContent));
         Assert.assertEquals("Unexpected response code for [" + request + "]",
                 HttpURLConnection.HTTP_NOT_FOUND, rc);
+    }
+
+    private void doTestTraversalRejected(String request) throws Exception {
+
+        ByteChunk res = new ByteChunk();
+        int rc = doTestTraversal(request, res);
+
+        String body = res.toString();
+        if (body == null) {
+            body = "";
+        }
+        Assert.assertFalse("Traversal succeeded for [" + request + "]. Response code [" + rc +
+                "], body [" + body + "]", body.contains("Index page"));
+        Assert.assertEquals("Unexpected response code for [" + request + "]",
+                HttpURLConnection.HTTP_BAD_REQUEST, rc);
     }
 
     private int doTestTraversal(String request, ByteChunk res) throws Exception {
@@ -589,7 +689,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testNonAsciiQueryStringWithB() throws Exception {
         doTestRewrite("RewriteRule ^/b/(.*)/id=(.*) /c?filename=$1&id=$2 [B]",
                 "/b/file01/id=%E5%9C%A8%E7%BA%BF%E6%B5%8B%E8%AF%95", "/c",
-                "filename=file01&id=%25E5%259C%25A8%25E7%25BA%25BF%25E6%25B5%258B%25E8%25AF%2595");
+                "filename=file01&id=%E5%9C%A8%E7%BA%BF%E6%B5%8B%E8%AF%95");
     }
 
 
@@ -598,8 +698,8 @@ public class TestRewriteValve extends TomcatBaseTest {
         // Note the double encoding of the result (httpd produces the same result)
         doTestRewrite("RewriteRule ^/b/(.*)/(.*)/id=(.*) /c/$1?filename=$2&id=$3 [B,R]",
                 "/b/%E5%9C%A8%E7%BA%BF/file01/id=%E6%B5%8B%E8%AF%95",
-                "/c/%25E5%259C%25A8%25E7%25BA%25BF",
-                "filename=file01&id=%25E6%25B5%258B%25E8%25AF%2595");
+                "/c/%E5%9C%A8%E7%BA%BF",
+                "filename=file01&id=%E6%B5%8B%E8%AF%95");
     }
 
 
@@ -615,7 +715,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithBothQsFlagsB() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B]",
-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
+                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%C2%A1", "id=%C2%A1");
     }
 
 
@@ -631,7 +731,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithBothQsFlagsRB() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B]",
-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
+                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%C2%A1", "id=%C2%A1");
     }
 
 
@@ -659,8 +759,8 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithBothQsFlagsBQSA() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B,QSA]",
-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1",
-                "id=%25C2%25A1&di=%C2%AE");
+                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%C2%A1",
+                "id=%C2%A1&di=%C2%AE");
     }
 
 
@@ -677,8 +777,8 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithBothQsFlagsRBQSA() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B,QSA]",
-                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%25C2%25A1",
-                "id=%25C2%25A1&di=%C2%AE");
+                "/b/%C2%A1/id=%C2%A1?di=%C2%AE", "/c/%C2%A1%C2%A1",
+                "id=%C2%A1&di=%C2%AE");
     }
 
 
@@ -714,7 +814,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithOriginalQsFlagsB() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]",
-                "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%C2%A1");
+                "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%C2%A1", "id=%C2%A1");
     }
 
 
@@ -730,7 +830,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithOriginalQsFlagsRB() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]",
-                "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%C2%A1");
+                "/b/%C2%A1?id=%C2%A1", "/c/%C2%A1%C2%A1", "id=%C2%A1");
     }
 
 
@@ -766,7 +866,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithRewriteQsFlagsB() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [B]",
-                "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
+                "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%C2%A1", "id=%C2%A1");
     }
 
 
@@ -791,7 +891,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     public void testUtf8WithRewriteQsFlagsRB() throws Exception {
         // Note %C2%A1 == \u00A1
         doTestRewrite("RewriteRule ^/b/(.*)/(.*) /c/\u00A1$1?$2 [R,B]",
-                "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%25C2%25A1", "id=%25C2%25A1");
+                "/b/%C2%A1/id=%C2%A1", "/c/%C2%A1%C2%A1", "id=%C2%A1");
     }
 
 
@@ -834,7 +934,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     @Test
     public void testUtf8FlagsB() throws Exception {
         // Note %C2%A1 == \u00A1
-        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]", "/b/%C2%A1", "/c/%C2%A1%25C2%25A1");
+        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [B]", "/b/%C2%A1", "/c/%C2%A1%C2%A1");
     }
 
 
@@ -848,7 +948,7 @@ public class TestRewriteValve extends TomcatBaseTest {
     @Test
     public void testUtf8FlagsRB() throws Exception {
         // Note %C2%A1 == \u00A1
-        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]", "/b/%C2%A1", "/c/%C2%A1%25C2%25A1");
+        doTestRewrite("RewriteRule ^/b/(.*) /c/\u00A1$1 [R,B]", "/b/%C2%A1", "/c/%C2%A1%C2%A1");
     }
 
 
@@ -1037,6 +1137,7 @@ public class TestRewriteValve extends TomcatBaseTest {
         rewriteValve.setConfiguration(config);
 
         Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
+        ctx.addServletMappingDecoded("/a/Z", "snoop");
         ctx.addServletMappingDecoded("/a/%5A", "snoop");
         ctx.addServletMappingDecoded("/c/*", "snoop");
         ctx.addServletMappingDecoded("/z/*", "snoop");
@@ -1227,5 +1328,177 @@ public class TestRewriteValve extends TomcatBaseTest {
             Assert.assertEquals(expectedURI, redirectURI);
             Assert.assertEquals(expectedStatusCode, rc);
         }
+    }
+
+
+    @Test
+    public void testEncodedUriSimple() throws Exception {
+        doTestRewriteWithEncoding("aaa");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedQuestionMark01() throws Exception {
+        doTestRewriteWithEncoding("a%3fa");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedQuestionMark02() throws Exception {
+        doTestRewriteWithEncoding("%3faa");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedQuestionMark03() throws Exception {
+        doTestRewriteWithEncoding("aa%3f");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedQuestionMarkAndQueryString() throws Exception {
+        doTestRewriteWithEncoding("a%3fa?b=c", "a%3fa", "b=c");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedSemicolon01() throws Exception {
+        doTestRewriteWithEncoding("a%3ba");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedSemicolon02() throws Exception {
+        doTestRewriteWithEncoding("%3baa");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedSemicolon03() throws Exception {
+        doTestRewriteWithEncoding("aa%3b");
+    }
+
+
+    @Test
+    public void testEncodedUriPlus() throws Exception {
+        doTestRewriteWithEncoding("a+b");
+    }
+
+
+    @Test
+    public void testEncodedUriEncodedPercent() throws Exception {
+        doTestRewriteWithEncoding("a%25a");
+    }
+
+
+    @Test
+    public void testEncodedQuestionMarkDoesNotBypassRule() throws Exception {
+        /*
+         * The [F] rule protects /c/secret. A literal '?' in the request path
+         * (sent as %3F) must not be treated as the start of a query string
+         * after the rewrite, else the [F] rule (which does not match
+         * "/c/secret?x") is bypassed and /c/secret is served.
+         */
+        doTestRewriteWithPathInfo("RewriteRule ^/b/(.*)$ /c/$1\n" + "RewriteRule ^/c/secret$ - [F]",
+                "/b/secret", "/b/secret%3Fx", "/c/secret%3fx", "/secret?x");
+    }
+
+
+    @Test
+    public void testEncodedSemicolonDoesNotBypassRule() throws Exception {
+        /*
+         * As above for a literal ';' (sent as %3B) which must not be treated
+         * as the start of a path parameter after the rewrite.
+         */
+        doTestRewriteWithPathInfo("RewriteRule ^/b/(.*)$ /c/$1\n" + "RewriteRule ^/c/secret$ - [F]",
+                "/b/secret", "/b/secret%3Bx", "/c/secret%3bx", "/secret;x");
+    }
+
+
+    @Test
+    public void testPathParameterInSubstitution01() throws Exception {
+        // Path parameters inserted by a rule are removed from the URI used
+        // for mapping
+        doTestRewriteWithPathInfo("RewriteRule ^/b/(.*)$ /c/$1;a=1", null, "/b/x", "/c/x", "/x");
+    }
+
+
+    @Test
+    public void testPathParameterInSubstitution02() throws Exception {
+        doTestRewriteWithPathInfo("RewriteRule ^/b/(.*)$ /c;a=1/$1", null, "/b/x", "/c/x", "/x");
+    }
+
+
+    private void doTestRewriteWithPathInfo(String config, String forbiddenRequest, String request,
+            String expectedURI, String expectedPathInfo) throws Exception {
+
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        RewriteValve rewriteValve = new RewriteValve();
+        ctx.getPipeline().addValve(rewriteValve);
+
+        rewriteValve.setConfiguration(config);
+
+        Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
+        ctx.addServletMappingDecoded("/c/*", "snoop");
+
+        tomcat.start();
+
+        ByteChunk res;
+        int rc;
+        if (forbiddenRequest != null) {
+            // Control. Confirm the rule blocks the request without the
+            // special character
+            res = new ByteChunk();
+            rc = getUrl("http://localhost:" + getPort() + forbiddenRequest, res, null);
+            Assert.assertEquals(HttpServletResponse.SC_FORBIDDEN, rc);
+        }
+
+        res = new ByteChunk();
+        rc = getUrl("http://localhost:" + getPort() + request, res, null);
+        res.setCharset(StandardCharsets.UTF_8);
+        String body = res.toString();
+        Assert.assertEquals(body, HttpServletResponse.SC_OK, rc);
+        RequestDescriptor requestDesc = SnoopResult.parse(body);
+        Assert.assertEquals(expectedURI, requestDesc.getRequestInfo("REQUEST-URI"));
+        Assert.assertEquals(expectedPathInfo, requestDesc.getRequestInfo("REQUEST-PATH-INFO"));
+    }
+
+
+    private void doTestRewriteWithEncoding(String segment) throws Exception {
+        doTestRewriteWithEncoding(segment, segment, null);
+    }
+
+    private void doTestRewriteWithEncoding(String segment, String expectedSegment, String expectedQueryString)
+            throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        RewriteValve rewriteValve = new RewriteValve();
+        tomcat.getHost().getPipeline().addValve(rewriteValve);
+
+        rewriteValve.setConfiguration("RewriteRule ^/source/(.*)$ /target/$1");
+
+        Tomcat.addServlet(ctx, "snoop", new SnoopServlet());
+        ctx.addServletMappingDecoded("/target/*", "snoop");
+
+        tomcat.start();
+
+        ByteChunk res = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/source/" + segment, res, false);
+
+        Assert.assertEquals(HttpServletResponse.SC_OK, rc);
+
+        res.setCharset(StandardCharsets.UTF_8);
+        String body = res.toString();
+        Assert.assertTrue(body, body.contains("REQUEST-URI: /target/" + expectedSegment));
+        Assert.assertTrue(body, body.contains("PATH-INFO: /" +
+                UDecoder.URLDecode(expectedSegment, StandardCharsets.UTF_8)));
+        Assert.assertTrue(body, body.contains("REQUEST-QUERY-STRING: " + expectedQueryString));
     }
 }
