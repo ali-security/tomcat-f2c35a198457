@@ -23,6 +23,7 @@ import java.util.List;
 
 import javax.naming.Context;
 
+import org.apache.catalina.Container;
 import org.apache.catalina.Group;
 import org.apache.catalina.LifecycleException;
 import org.apache.catalina.Role;
@@ -94,11 +95,16 @@ public class UserDatabaseRealm extends RealmBase {
      */
     @Override
     public boolean hasRole(Wrapper wrapper, Principal principal, String role) {
-        // Check for a role alias defined in a <security-role-ref> element
+        // Check for a role alias
         if (wrapper != null) {
-            String realRole = wrapper.findSecurityReference(role);
-            if (realRole != null)
-                role = realRole;
+            Container parent = wrapper.getParent();
+            if (parent instanceof org.apache.catalina.Context) {
+                org.apache.catalina.Context context = (org.apache.catalina.Context) parent;
+                String realRole = context.findRoleMapping(role);
+                if (realRole != null) {
+                    role = realRole;
+                }
+            }
         }
         if (principal instanceof GenericPrincipal) {
             GenericPrincipal gp = (GenericPrincipal) principal;
