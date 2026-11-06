@@ -17,6 +17,7 @@
 package org.apache.coyote.http2;
 
 import java.nio.ByteBuffer;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.tomcat.util.res.StringManager;
 
@@ -32,7 +33,7 @@ public class HpackDecoder {
     /**
      * The object that receives the headers that are emitted from this decoder
      */
-    private HeaderEmitter headerEmitter;
+    private final AtomicReference<HeaderEmitter> headerEmitter = new AtomicReference<>();
 
     /**
      * The header table
@@ -383,16 +384,22 @@ public class HpackDecoder {
 
 
     HeaderEmitter getHeaderEmitter() {
-        return headerEmitter;
+        return headerEmitter.get();
     }
 
 
     void setHeaderEmitter(HeaderEmitter headerEmitter) {
-        this.headerEmitter = headerEmitter;
+        this.headerEmitter.set(headerEmitter);
         // Reset limit tracking
         headerCount = 0;
         countedCookie = false;
         headerSize = 0;
+    }
+
+
+    void compareAndSetHeaderEmitter(HeaderEmitter expectedValue, HeaderEmitter newValue) {
+        // Only used in stream replacement so should not reset limits
+        this.headerEmitter.compareAndSet(expectedValue, newValue);
     }
 
 
@@ -424,7 +431,7 @@ public class HpackDecoder {
         int inc = 3 + name.length() + value.length();
         headerSize += inc;
         if (!isHeaderCountExceeded() && !isHeaderSizeExceeded(0)) {
-            headerEmitter.emitHeader(name, value);
+            headerEmitter.get().emitHeader(name, value);
         }
     }
 

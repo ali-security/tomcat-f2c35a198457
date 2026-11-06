@@ -1844,6 +1844,12 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
                 streams.put(original.getIdentifier(), replacement);
                 original.replaceStream(replacement);
             }
+            // The decoder is created by the parser before any headers are
+            // emitted. If it does not exist, no stream can be the emitter.
+            HpackDecoder decoder = hpackDecoder;
+            if (decoder != null && original instanceof Stream) {
+                decoder.compareAndSetHeaderEmitter((Stream) original, HEADER_SINK);
+            }
         }
 
         Set<AbstractStream> streamsToNotify = null;
