@@ -69,6 +69,13 @@ import org.apache.tomcat.util.http.RequestUtil;
 public class RewriteValve extends ValveBase {
 
     /**
+     * The maximum number of rounds of rewrite rules triggered by the next flag [N]. This bounds the processing of
+     * configurations whose next rules do not converge, which would otherwise spin in the rule loop without ever
+     * completing the request.
+     */
+    private static final int MAX_REWRITE_ROUNDS = 1000;
+
+    /**
      * The rewrite rules that the valve will use.
      */
     protected RewriteRule[] rules = null;
@@ -253,6 +260,7 @@ public class RewriteValve extends ValveBase {
                 }
             } catch (IOException e) {
                 containerLog.error(sm.getString("rewriteValve.readError"), e);
+                break;
             }
         }
         this.rules = rules.toArray(new RewriteRule[0]);
@@ -313,6 +321,7 @@ public class RewriteValve extends ValveBase {
             boolean done = false;
             boolean qsa = false;
             boolean qsd = false;
+            int rounds = 0;
             for (int i = 0; i < rules.length; i++) {
                 RewriteRule rule = rules[i];
                 CharSequence test = (rule.isHost()) ? host : urlDecoded;
@@ -383,11 +392,7 @@ public class RewriteValve extends ValveBase {
                                         rewrittenQueryStringDecoded, uriCharset));
                                 urlStringEncoded.append('&');
                                 urlStringEncoded.append(queryStringOriginalEncoded);
-                            } else if (index == urlStringEncoded.length() - 1) {
-                                // if the ? is the last character delete it, its only purpose was to
-                                // prevent the rewrite module from appending the query string
-                                urlStringEncoded.deleteCharAt(index);
-                            } else {
+                            } else if (!rewrittenQueryStringDecoded.isEmpty()) {
                                 urlStringEncoded.append('?');
                                 urlStringEncoded.append(URLEncoder.QUERY.encode(
                                         rewrittenQueryStringDecoded, uriCharset));
@@ -448,12 +453,13 @@ public class RewriteValve extends ValveBase {
 
                 // - chain (skip remaining chained rules if this one does not match)
                 if (rule.isChain() && newtest == null) {
-                    for (int j = i; j < rules.length; j++) {
-                        if (!rules[j].isChain()) {
-                            i = j;
-                            break;
-                        }
+                    // Skip the remaining rules in the chain, including the
+                    // terminal rule that does not have the chain flag set.
+                    int j = i + 1;
+                    while (j < rules.length && rules[j].isChain()) {
+                        j++;
                     }
+                    i = j;
                     continue;
                 }
                 // - last (stop rewriting here)
@@ -462,7 +468,13 @@ public class RewriteValve extends ValveBase {
                 }
                 // - next (redo again)
                 if (rule.isNext() && newtest != null) {
-                    i = 0;
+                    if (rounds >= MAX_REWRITE_ROUNDS) {
+                        containerLog.warn(sm.getString("rewriteValve.maxRounds",
+                                Integer.valueOf(MAX_REWRITE_ROUNDS), request.getRequestURI()));
+                        break;
+                    }
+                    rounds++;
+                    i = -1;
                     continue;
                 }
                 // - skip (n rules)
@@ -523,7 +535,7 @@ public class RewriteValve extends ValveBase {
                         chunk = request.getCoyoteRequest().queryString().getCharChunk();
                         chunk.recycle();
                         chunk.append(URLEncoder.QUERY.encode(queryStringDecoded, uriCharset));
-                        if (qsa && queryStringOriginalEncoded != null &&
+                        if (!qsd && qsa && queryStringOriginalEncoded != null &&
                                 !queryStringOriginalEncoded.isEmpty()) {
                             chunk.append('&');
                             chunk.append(queryStringOriginalEncoded);
