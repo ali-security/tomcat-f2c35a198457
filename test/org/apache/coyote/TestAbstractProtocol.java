@@ -176,6 +176,45 @@ public class TestAbstractProtocol {
 
 
     /**
+     * CVE-2021-43980: while a container thread is using a connection's
+     * Processor, the endpoint closes that connection on another thread (e.g. the
+     * Poller after a timeout or an error), which releases the Processor
+     * associated with the connection. The container thread then releases the
+     * same Processor when it finishes, so the Processor is added to the pool of
+     * recycled processors twice and two connections end up sharing it.
+     */
+    @Test
+    public void testProcessorNotSharedAfterConcurrentClose() throws Exception {
+        NioEndpoint endpoint = new NioEndpoint();
+        final TesterSocketWrapper closedByEndpoint = new TesterSocketWrapper(endpoint);
+        TesterProtocol protocol = new TesterProtocol(false, endpoint) {
+            @Override
+            protected Processor createProcessor() {
+                return new TesterKeepAliveProcessor(closedByEndpoint);
+            }
+        };
+        AbstractProtocol.ConnectionHandler<NioChannel> handler =
+                new AbstractProtocol.ConnectionHandler<>(protocol);
+        // Closing a socket wrapper releases its Processor via the handler
+        endpoint.setHandler(handler);
+
+        Assert.assertEquals(SocketState.OPEN,
+                handler.process(closedByEndpoint, SocketEvent.OPEN_READ));
+
+        // Two new connections, both part way through a request
+        TesterSocketWrapper wrapperA = new TesterSocketWrapper(endpoint);
+        TesterSocketWrapper wrapperB = new TesterSocketWrapper(endpoint);
+        Assert.assertEquals(SocketState.LONG, handler.process(wrapperA, SocketEvent.OPEN_READ));
+        Assert.assertEquals(SocketState.LONG, handler.process(wrapperB, SocketEvent.OPEN_READ));
+
+        Assert.assertNotNull(wrapperA.getCurrentProcessor());
+        Assert.assertNotNull(wrapperB.getCurrentProcessor());
+        Assert.assertNotSame("Two connections are sharing the same Processor (CVE-2021-43980)",
+                wrapperA.getCurrentProcessor(), wrapperB.getCurrentProcessor());
+    }
+
+
+    /**
      * Stands in for {@code Http11Processor}. The key behaviour it reproduces is
      * that {@link #getLeftoverInput()} returns a view of - rather than a copy of
      * - its own internal buffer, and that {@link #recycle()} does not clear that
@@ -247,6 +286,86 @@ public class TestAbstractProtocol {
         @Override
         public void recycle() {
             // As per Http11Processor, recycling does not clear the input buffer.
+        }
+
+        @Override
+        public boolean isUpgrade() {
+            // Must be false so that release() returns this processor to the
+            // pool of recycled processors, as it does for Http11Processor.
+            return false;
+        }
+
+        @Override
+        public boolean isAsync() {
+            return false;
+        }
+
+        @Override
+        public void timeoutAsync(long now) {
+            // NO-OP
+        }
+
+        @Override
+        public Request getRequest() {
+            return null;
+        }
+
+        @Override
+        public void setSslSupport(SSLSupport sslSupport) {
+            // NO-OP
+        }
+
+        @Override
+        public void pause() {
+            // NO-OP
+        }
+
+        @Override
+        public boolean checkAsyncTimeoutGeneration() {
+            return false;
+        }
+    }
+
+
+    /**
+     * Stands in for {@code Http11Processor} for
+     * {@link #testProcessorNotSharedAfterConcurrentClose()}. For one connection
+     * the endpoint closes the socket while the request is being processed and
+     * the request then completes (keep-alive). Any other connection is left part
+     * way through a request so it keeps its Processor.
+     */
+    private static class TesterKeepAliveProcessor implements Processor {
+
+        private final SocketWrapperBase<?> closeDuringProcessing;
+
+        TesterKeepAliveProcessor(SocketWrapperBase<?> closeDuringProcessing) {
+            this.closeDuringProcessing = closeDuringProcessing;
+        }
+
+        @Override
+        public SocketState process(SocketWrapperBase<?> socketWrapper, SocketEvent status) {
+            if (socketWrapper == closeDuringProcessing) {
+                // In the real server this happens on another thread (e.g. the
+                // Poller) while this thread is still using this Processor.
+                socketWrapper.close();
+                return SocketState.OPEN;
+            }
+            return SocketState.LONG;
+        }
+
+        @Override
+        public UpgradeToken getUpgradeToken() {
+            return null;
+        }
+
+        @Override
+        public ByteBuffer getLeftoverInput() {
+            return null;
+        }
+
+        @Override
+        public void recycle() {
+            // NO-OP
         }
 
         @Override

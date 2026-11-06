@@ -29,6 +29,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 
 import org.apache.juli.logging.Log;
 import org.apache.juli.logging.LogFactory;
@@ -106,10 +107,20 @@ public abstract class SocketWrapperBase<E> {
     protected volatile OperationState<?> writeOperation = null;
 
     /**
-     * The org.apache.coyote.Processor instance currently associated
-     * with the wrapper.
+     * The org.apache.coyote.Processor instance currently associated with the
+     * wrapper. Only populated when required to maintain wrapper<->Processor
+     * mapping between calls to
+     * {@link AbstractEndpoint.Handler#process(SocketWrapperBase, SocketEvent)}.
+     * Use {@link #getCurrentProcessor()}, {@link #setCurrentProcessor(Object)}
+     * and {@link #takeCurrentProcessor()} to access it. The field stays
+     * protected, and is only made volatile, so that the public API of this
+     * class is unchanged.
      */
-    protected Object currentProcessor = null;
+    protected volatile Object currentProcessor = null;
+
+    @SuppressWarnings("rawtypes")
+    private static final AtomicReferenceFieldUpdater<SocketWrapperBase,Object> CURRENT_PROCESSOR_UPDATER =
+            AtomicReferenceFieldUpdater.newUpdater(SocketWrapperBase.class, Object.class, "currentProcessor");
 
     public SocketWrapperBase(E socket, AbstractEndpoint<E,?> endpoint) {
         this.socket = socket;
@@ -141,6 +152,17 @@ public abstract class SocketWrapperBase<E> {
 
     public void setCurrentProcessor(Object currentProcessor) {
         this.currentProcessor = currentProcessor;
+    }
+
+    /**
+     * Atomically returns the Processor associated with this wrapper and clears
+     * the association, so that only one thread can ever own (and release) it.
+     *
+     * @return The Processor that was associated with this wrapper, or
+     *         {@code null} if there was none
+     */
+    public Object takeCurrentProcessor() {
+        return CURRENT_PROCESSOR_UPDATER.getAndSet(this, null);
     }
 
     /**
