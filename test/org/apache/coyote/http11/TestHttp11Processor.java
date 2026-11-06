@@ -251,31 +251,6 @@ public class TestHttp11Processor extends TomcatBaseTest {
 
 
     @Test
-    public void testWithTEIdentity() throws Exception {
-        getTomcatInstanceTestWebapp(false, true);
-
-        String request =
-            "POST /test/echo-params.jsp HTTP/1.1" + SimpleHttpClient.CRLF +
-            "Host: any" + SimpleHttpClient.CRLF +
-            "Transfer-encoding: identity" + SimpleHttpClient.CRLF +
-            "Content-Length: 9" + SimpleHttpClient.CRLF +
-            "Content-Type: application/x-www-form-urlencoded" +
-                    SimpleHttpClient.CRLF +
-            "Connection: close" + SimpleHttpClient.CRLF +
-                SimpleHttpClient.CRLF +
-            "test=data";
-
-        Client client = new Client(getPort());
-        client.setRequest(new String[] {request});
-
-        client.connect();
-        client.processRequest();
-        Assert.assertTrue(client.isResponse200());
-        Assert.assertTrue(client.getResponseBody().contains("test - data"));
-    }
-
-
-    @Test
     public void testWithTESavedRequest() throws Exception {
         getTomcatInstanceTestWebapp(false, true);
 
@@ -1675,5 +1650,112 @@ public class TestHttp11Processor extends TomcatBaseTest {
 
             out.print(" and request.getServerPort() is " + req.getServerPort());
         }
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown01() throws Exception {
+        doTestTEHeaderInvalid("identity", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown02() throws Exception {
+        doTestTEHeaderInvalid("identity, chunked", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown03() throws Exception {
+        doTestTEHeaderInvalid("unknown, chunked", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown04() throws Exception {
+        doTestTEHeaderInvalid("void", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown05() throws Exception {
+        doTestTEHeaderInvalid("void, chunked", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown06() throws Exception {
+        doTestTEHeaderInvalid("void, identity", false);
+    }
+
+
+    @Test
+    public void testTEHeaderUnknown07() throws Exception {
+        doTestTEHeaderInvalid("identity, void", false);
+    }
+
+
+    @Test
+    public void testTEHeaderChunkedNotLast01() throws Exception {
+        doTestTEHeaderInvalid("chunked, void", true);
+    }
+
+
+    private void doTestTEHeaderInvalid(String headerValue, boolean badRequest) throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        // Add servlet
+        Tomcat.addServlet(ctx, "TesterServlet", new TesterServlet(false));
+        ctx.addServletMappingDecoded("/foo", "TesterServlet");
+
+        tomcat.start();
+
+        String request =
+                "GET /foo HTTP/1.1" + SimpleHttpClient.CRLF +
+                "Host: localhost:" + getPort() + SimpleHttpClient.CRLF +
+                "Transfer-Encoding: " + headerValue + SimpleHttpClient.CRLF +
+                SimpleHttpClient.CRLF;
+
+        Client client = new Client(tomcat.getConnector().getLocalPort());
+        client.setRequest(new String[] {request});
+
+        client.connect();
+        client.processRequest(false);
+
+        if (badRequest) {
+            Assert.assertTrue(client.isResponse400());
+        } else {
+            Assert.assertTrue(client.isResponse501());
+        }
+    }
+
+
+    @Test
+    public void testWithTEChunkedHttp10() throws Exception {
+
+        getTomcatInstanceTestWebapp(false, true);
+
+        String request =
+            "POST /test/echo-params.jsp HTTP/1.0" + SimpleHttpClient.CRLF +
+            "Host: any" + SimpleHttpClient.CRLF +
+            "Transfer-encoding: chunked" + SimpleHttpClient.CRLF +
+            "Content-Type: application/x-www-form-urlencoded" +
+                    SimpleHttpClient.CRLF +
+            "Connection: close" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF +
+            "9" + SimpleHttpClient.CRLF +
+            "test=data" + SimpleHttpClient.CRLF +
+            "0" + SimpleHttpClient.CRLF +
+            SimpleHttpClient.CRLF;
+
+        Client client = new Client(getPort());
+        client.setRequest(new String[] {request});
+
+        client.connect();
+        client.processRequest();
+        Assert.assertTrue(client.isResponse400());
     }
 }
