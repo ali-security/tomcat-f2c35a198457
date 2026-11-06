@@ -1602,8 +1602,11 @@ public class JNDIRealm extends RealmBase {
         if (username == null || userPatternArray[curUserPattern] == null)
             return null;
 
-        // Form the dn from the user pattern
-        String dn = connection.userPatternFormatArray[curUserPattern].format(new String[] { username });
+        // Form the DistinguishedName from the user pattern.
+        // Escape in case username contains a character with special meaning in
+        // an attribute value.
+        String dn = connection.userPatternFormatArray[curUserPattern].format(
+                new String[] { doAttributeValueEscaping(username) });
 
         try {
             user = getUserByPattern(connection.context, username, attrIds, dn);
@@ -1644,7 +1647,9 @@ public class JNDIRealm extends RealmBase {
             return null;
 
         // Form the search filter
-        String filter = connection.userSearchFormat.format(new String[] { username });
+        // Escape in case username contains a character with special meaning in
+        // a search filter.
+        String filter = connection.userSearchFormat.format(new String[] { doFilterEscaping(username) });
 
         // Set up the search controls
         SearchControls constraints = new SearchControls();
@@ -1815,6 +1820,8 @@ public class JNDIRealm extends RealmBase {
          if (credentials == null || user == null)
              return false;
 
+         // This is returned from the directory so will be attribute value
+         // escaped if required
          String dn = user.getDN();
          if (dn == null)
              return false;
@@ -1911,7 +1918,11 @@ public class JNDIRealm extends RealmBase {
         if (user == null)
             return null;
 
+        // This is returned from the directory so will be attribute value
+        // escaped if required
         String dn = user.getDN();
+        // This is the name the user provided to the authentication process so
+        // it will not be escaped
         String username = user.getUserName();
         String userRoleId = user.getUserRoleId();
 
@@ -1939,8 +1950,13 @@ public class JNDIRealm extends RealmBase {
         if ((connection.roleFormat == null) || (roleName == null))
             return list;
 
-        // Set up parameters for an appropriate search
-        String filter = connection.roleFormat.format(new String[] { doRFC2254Encoding(dn), username, userRoleId });
+        // Set up parameters for an appropriate search filter
+        // The dn is already attribute value escaped but the others are not
+        // This is a filter so all input will require filter escaping
+        String filter = connection.roleFormat.format(new String[] {
+                doFilterEscaping(dn),
+                doFilterEscaping(doAttributeValueEscaping(username)),
+                doFilterEscaping(doAttributeValueEscaping(userRoleId)) });
         SearchControls controls = new SearchControls();
         if (roleSubtree)
             controls.setSearchScope(SearchControls.SUBTREE_SCOPE);
@@ -1954,7 +1970,9 @@ public class JNDIRealm extends RealmBase {
             Name name = np.parse(dn);
             String nameParts[] = new String[name.size()];
             for (int i = 0; i < name.size(); i++) {
-                nameParts[i] = name.get(i);
+                // May have been returned with \<char> escaping rather than
+                // \<hex><hex>. Make sure it is \<hex><hex>.
+                nameParts[i] =  convertToHexEscape(name.get(i));
             }
             base = connection.roleBaseFormat.format(nameParts);
         } else {
@@ -1975,7 +1993,7 @@ public class JNDIRealm extends RealmBase {
                 Attributes attrs = result.getAttributes();
                 if (attrs == null)
                     continue;
-                String dname = getDistinguishedName(connection.context, roleBase, result);
+                String dname = getDistinguishedName(connection.context, base, result);
                 String name = getAttributeValue(roleName, attrs);
                 if (name != null && dname != null) {
                     groupMap.put(dname, name);
@@ -2008,14 +2026,19 @@ public class JNDIRealm extends RealmBase {
                 Map<String, String> newThisRound = new HashMap<>(); // Stores the groups we find in this iteration
 
                 for (Entry<String, String> group : newGroups.entrySet()) {
-                    filter = connection.roleFormat.format(new String[] { doRFC2254Encoding(group.getKey()),
-                            group.getValue(), group.getValue() });
+                    // Group key is already value escaped if required
+                    // Group value is not value escaped
+                    // Everything needs to be filter escaped
+                    filter = connection.roleFormat.format(new String[] {
+                            doFilterEscaping(group.getKey()),
+                            doFilterEscaping(doAttributeValueEscaping(group.getValue())),
+                            doFilterEscaping(doAttributeValueEscaping(group.getValue())) });
 
                     if (containerLog.isTraceEnabled()) {
-                        containerLog.trace("Perform a nested group search with base "+ roleBase + " and filter " + filter);
+                        containerLog.trace("Perform a nested group search with base "+ base + " and filter " + filter);
                     }
 
-                    results = searchAsUser(connection.context, user, roleBase, filter, controls,
+                    results = searchAsUser(connection.context, user, base, filter, controls,
                             isRoleSearchAsUser());
 
                     try {
@@ -2024,7 +2047,7 @@ public class JNDIRealm extends RealmBase {
                             Attributes attrs = result.getAttributes();
                             if (attrs == null)
                                 continue;
-                            String dname = getDistinguishedName(connection.context, roleBase, result);
+                            String dname = getDistinguishedName(connection.context, base, result);
                             String name = getAttributeValue(roleName, attrs);
                             if (name != null && dname != null && !groupMap.keySet().contains(dname)) {
                                 groupMap.put(dname, name);
@@ -2743,10 +2766,39 @@ public class JNDIRealm extends RealmBase {
      *     )  -&gt; \29
      *     \  -&gt; \5c
      *     \0 -&gt; \00
+     *
      * @param inString string to escape according to RFC 2254 guidelines
+     *
+     * @return String the escaped/encoded result
+     *
+     * @deprecated Will be removed in Tomcat 10.1.x onwards
+     */
+    @Deprecated
+    protected String doRFC2254Encoding(String inString) {
+        return doFilterEscaping(inString);
+    }
+
+
+    /**
+     * Given an LDAP search string, returns the string with certain characters
+     * escaped according to RFC 2254 guidelines.
+     * The character mapping is as follows:
+     *     char -&gt;  Replacement
+     *    ---------------------------
+     *     *  -&gt; \2a
+     *     (  -&gt; \28
+     *     )  -&gt; \29
+     *     \  -&gt; \5c
+     *     \0 -&gt; \00
+     *
+     * @param inString string to escape according to RFC 2254 guidelines
+     *
      * @return String the escaped/encoded result
      */
-    protected String doRFC2254Encoding(String inString) {
+    protected String doFilterEscaping(String inString) {
+        if (inString == null) {
+            return null;
+        }
         StringBuilder buf = new StringBuilder(inString.length());
         for (int i = 0; i < inString.length(); i++) {
             char c = inString.charAt(i);
@@ -2833,6 +2885,81 @@ public class JNDIRealm extends RealmBase {
         } else {
             return name.toString();
         }
+    }
+
+
+    /**
+     * Implements the necessary escaping to represent an attribute value as a
+     * String as per RFC 4514.
+     *
+     * @param input The original attribute value
+     * @return      The string representation of the attribute value
+     */
+    protected String doAttributeValueEscaping(String input) {
+        if (input == null) {
+            return null;
+        }
+        int len = input.length();
+        StringBuilder result = new StringBuilder();
+
+        for (int i = 0; i < len; i++) {
+            char c = input.charAt(i);
+            switch (c) {
+                case ' ': {
+                    if (i == 0 || i == (len -1)) {
+                        result.append("\\20");
+                    } else {
+                        result.append(c);
+                    }
+                    break;
+                }
+                case '#': {
+                    if (i == 0 ) {
+                        result.append("\\23");
+                    } else {
+                        result.append(c);
+                    }
+                    break;
+                }
+                case '\"': {
+                    result.append("\\22");
+                    break;
+                }
+                case '+': {
+                    result.append("\\2B");
+                    break;
+                }
+                case ',': {
+                    result.append("\\2C");
+                    break;
+                }
+                case ';': {
+                    result.append("\\3B");
+                    break;
+                }
+                case '<': {
+                    result.append("\\3C");
+                    break;
+                }
+                case '>': {
+                    result.append("\\3E");
+                    break;
+                }
+                case '\\': {
+                    result.append("\\5C");
+                    break;
+                }
+                case '\u0000': {
+                    result.append("\\00");
+                    break;
+                }
+                default:
+                    result.append(c);
+            }
+
+        }
+
+        return result.toString();
     }
 
 
