@@ -17,8 +17,12 @@
 package org.apache.catalina.session;
 
 import java.io.File;
+import java.io.FileOutputStream;
 import java.io.IOException;
+import java.lang.reflect.Method;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 
 import org.junit.After;
 import org.junit.Assert;
@@ -213,5 +217,42 @@ public class TestFileStore {
         fileStore.remove(VALID_SESSION_ID);
         Assert.assertFalse("Session file inside the storage directory was not removed",
                 validSessionFile.exists());
+    }
+
+
+    /**
+     * CVE-2022-23181: the location of a session file is checked using its
+     * canonical path. The File that is then used to read, write or delete the
+     * session must be the canonical File that was checked rather than the
+     * original path, else replacing a symbolic link in the original path
+     * between the check and the use redirects the I/O outside the storage
+     * directory.
+     */
+    @Test
+    public void testSymbolicLinkReplacedAfterCheck() throws Exception {
+        File targetSessionFile = new File(storageDir, "target.session");
+        Assert.assertTrue(targetSessionFile.createNewFile());
+        Path link = new File(storageDir, "link.session").toPath();
+        Files.createSymbolicLink(link, targetSessionFile.toPath());
+
+        // The link points inside the storage directory so the check passes
+        Method fileMethod = FileStore.class.getDeclaredMethod("file", String.class);
+        fileMethod.setAccessible(true);
+        File checked = (File) fileMethod.invoke(fileStore, "link");
+        Assert.assertNotNull(checked);
+
+        // A local attacker replaces the link after the check
+        Files.delete(link);
+        Files.createSymbolicLink(link, outsideSessionFile.toPath());
+
+        // Use the checked File the same way FileStore.save() does
+        try (FileOutputStream fos = new FileOutputStream(checked.getAbsolutePath())) {
+            fos.write("session".getBytes(StandardCharsets.ISO_8859_1));
+        }
+
+        Assert.assertEquals("Session data was written outside the storage directory",
+                0, outsideSessionFile.length());
+        Assert.assertTrue("Session data was not written to the checked location",
+                targetSessionFile.length() > 0);
     }
 }
