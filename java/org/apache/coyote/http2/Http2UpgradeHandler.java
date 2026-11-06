@@ -1007,7 +1007,11 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
                 if (this == stream) {
                     continue;
                 }
-                ((Stream) stream).notifyConnection();
+                // Nor on a stream that has been replaced, which may be included
+                // in the backlog as a parent. Skip it if it appears here.
+                if (stream instanceof Stream) {
+                    ((Stream) stream).notifyConnection();
+                }
             }
         }
     }
@@ -1832,8 +1836,63 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
 
     void replaceStream(AbstractNonZeroStream original, AbstractNonZeroStream replacement) {
         synchronized (priorityTreeLock) {
-            streams.replace(original.getIdentifier(), replacement);
-            original.replaceStream(replacement);
+            AbstractNonZeroStream current = streams.get(original.getIdentifier());
+            // Might already have been recycled or removed from the priority
+            // tree entirely. Only replace it if the full stream is still in the
+            // priority tree.
+            if (current instanceof Stream) {
+                streams.put(original.getIdentifier(), replacement);
+                original.replaceStream(replacement);
+            }
+        }
+
+        Set<AbstractStream> streamsToNotify = null;
+        synchronized (this) {
+            /*
+             * If the stream being replaced is still in the backlog (usually because it has been reset) remove
+             * the stream from the backlog along with its allocation request
+             */
+            BacklogTracker tracker = backLogStreams.remove(original);
+            if (tracker != null) {
+                // Remove unallocated request from the backlog
+                backLogSize -= tracker.getRemainingReservation();
+                /*
+                 * If the stream had received an allocation but not used it, return that allocation to the
+                 * connection window. An allocation is only deducted from the connection window when the stream
+                 * uses it so the unused allocation is still part of the window. A window update does not release
+                 * the backlog while the window is greater than zero so, if other streams are waiting in the
+                 * backlog, release the whole backlog (as releaseBackLog() does when the window can satisfy it) so
+                 * those streams obtain their allocations directly from the connection window.
+                 */
+                if (tracker.getUnusedAllocation() > 0 && backLogSize > 0) {
+                    streamsToNotify = new HashSet<>(backLogStreams.keySet());
+                    backLogStreams.clear();
+                    backLogSize = 0;
+                } else if (!replacement.getChildStreams().isEmpty()) {
+                    /*
+                     * The replacement has taken the place of the stream in the
+                     * priority tree, including its children. Add it to the
+                     * backlog as a parent so that any of those children that
+                     * are in the backlog can still be reached when allocating.
+                     */
+                    backLogStreams.put(replacement, new BacklogTracker());
+                }
+            }
+        }
+
+        if (streamsToNotify != null) {
+            for (AbstractStream stream : streamsToNotify) {
+                if (log.isDebugEnabled()) {
+                    log.debug(sm.getString("upgradeHandler.releaseBacklog",
+                            connectionId, stream.getIdAsString()));
+                }
+                // There is never any O/P on stream zero (or on a stream that
+                // has already been replaced) but they may be included in the
+                // backlog as parents. Skip them if they appear here.
+                if (stream instanceof Stream) {
+                    ((Stream) stream).notifyConnection();
+                }
+            }
         }
     }
 
