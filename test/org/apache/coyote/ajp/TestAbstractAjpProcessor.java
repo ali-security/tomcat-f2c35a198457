@@ -631,6 +631,54 @@ public class TestAbstractAjpProcessor extends TomcatBaseTest {
         }
     }
 
+    /*
+     * CVE-2026-78383. A request that fails before the request body has been
+     * read must not wait for the request body before the end of the response
+     * is sent (the connection is closed after an error so there is no need to
+     * swallow the body).
+     */
+    @Test
+    public void testErrorWithUnsentRequestBody() throws Exception {
+        Tomcat tomcat = getTomcatInstance();
+        Assert.assertTrue(tomcat.getConnector().setProperty("requiredSecret", "RIGHTSECRET"));
+        // Limit the time spent waiting for a request body that is never sent
+        Assert.assertTrue(tomcat.getConnector().setProperty("connectionTimeout", "10000"));
+        tomcat.start();
+
+        // No file system docBase required
+        Context ctx = tomcat.addContext("", null);
+
+        Tomcat.addServlet(ctx, "helloWorld", new HelloWorldServlet());
+        ctx.addServletMappingDecoded("/", "helloWorld");
+
+        SimpleAjpClient ajpClient = new SimpleAjpClient();
+        ajpClient.setPort(getPort());
+        ajpClient.connect();
+
+        validateCpong(ajpClient.cping());
+
+        ajpClient.setMethod("POST");
+        TesterAjpMessage forwardMessage = ajpClient.createForwardMessage();
+        // A request body is announced but it is never sent
+        forwardMessage.addHeader(0xA008, "10");
+        // The wrong secret fails the request before the body is read
+        forwardMessage.addAttribute(0x0C, "WRONGSECRET");
+        forwardMessage.end();
+
+        long start = System.currentTimeMillis();
+        TesterAjpMessage responseHeaders = ajpClient.sendMessage(forwardMessage, null);
+        // Expect 3 packets: headers, body, end
+        validateResponseHeaders(responseHeaders, 403, "403");
+        validateResponseBody(ajpClient.readMessage(), "<p><b>Type</b> Status Report</p>");
+        validateResponseEnd(ajpClient.readMessage(), false);
+        long duration = System.currentTimeMillis() - start;
+
+        // The response must not have waited for the connection timeout
+        Assert.assertTrue("Response took [" + duration + "] ms", duration < 5000);
+
+        ajpClient.disconnect();
+    }
+
     @Test
     public void testKeepAlive() throws Exception {
         Tomcat tomcat = getTomcatInstance();
