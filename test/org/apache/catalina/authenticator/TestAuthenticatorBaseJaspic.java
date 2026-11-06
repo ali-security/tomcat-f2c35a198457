@@ -16,15 +16,21 @@
  */
 package org.apache.catalina.authenticator;
 
+import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import javax.security.auth.Subject;
+import javax.security.auth.callback.Callback;
 import javax.security.auth.callback.CallbackHandler;
+import javax.security.auth.callback.UnsupportedCallbackException;
 import javax.security.auth.message.AuthException;
 import javax.security.auth.message.AuthStatus;
 import javax.security.auth.message.MessageInfo;
 import javax.security.auth.message.MessagePolicy;
+import javax.security.auth.message.callback.PasswordValidationCallback;
 import javax.security.auth.message.config.AuthConfigFactory;
 import javax.security.auth.message.module.ServerAuthModule;
 import javax.servlet.http.HttpServletRequest;
@@ -36,6 +42,7 @@ import org.junit.Test;
 
 import org.apache.catalina.Context;
 import org.apache.catalina.authenticator.jaspic.SimpleAuthConfigProvider;
+import org.apache.catalina.startup.TesterMapRealm;
 import org.apache.catalina.startup.TesterServlet;
 import org.apache.catalina.startup.Tomcat;
 import org.apache.catalina.startup.TomcatBaseTest;
@@ -85,6 +92,59 @@ public class TestAuthenticatorBaseJaspic extends TomcatBaseTest {
     }
 
 
+    /*
+     * CVE-2026-75973. When several web applications share the default
+     * SimpleAuthConfigProvider, each one must authenticate against its own
+     * Realm rather than the Realm of the first web application to
+     * authenticate a request.
+     */
+    @Test
+    public void testDefaultProviderUsesRealmOfEachContext() throws Exception {
+        registerDefaultProvider(TesterServerAuthModulePassword.class);
+
+        Tomcat tomcat = getTomcatInstance();
+        addContext(tomcat, "/a", "userA", "passwordA");
+        addContext(tomcat, "/b", "userB", "passwordB");
+
+        tomcat.start();
+
+        // The first request initialises JASPIC for /a
+        Assert.assertEquals(HttpServletResponse.SC_OK, doRequest("/a", "userA", "passwordA"));
+        // /b must use its own Realm
+        Assert.assertEquals(HttpServletResponse.SC_OK, doRequest("/b", "userB", "passwordB"));
+        Assert.assertEquals(HttpServletResponse.SC_FORBIDDEN, doRequest("/b", "userA", "passwordA"));
+        Assert.assertEquals(HttpServletResponse.SC_FORBIDDEN, doRequest("/a", "userB", "passwordB"));
+    }
+
+
+    private void addContext(Tomcat tomcat, String contextPath, String user, String password) {
+        Context ctx = tomcat.addContext(contextPath, null);
+        Tomcat.addServlet(ctx, "servlet", new TesterServlet());
+        ctx.addServletMappingDecoded("/", "servlet");
+        TesterMapRealm realm = new TesterMapRealm();
+        realm.addUser(user, password);
+        ctx.setRealm(realm);
+    }
+
+
+    private int doRequest(String contextPath, String user, String password) throws IOException {
+        Map<String,List<String>> reqHeaders = new HashMap<>();
+        List<String> userValues = new ArrayList<>();
+        userValues.add(user);
+        reqHeaders.put(TesterServerAuthModulePassword.USER_HEADER, userValues);
+        List<String> passwordValues = new ArrayList<>();
+        passwordValues.add(password);
+        reqHeaders.put(TesterServerAuthModulePassword.PASSWORD_HEADER, passwordValues);
+
+        ByteChunk bc = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + contextPath + "/", bc, reqHeaders, null);
+        if (rc == HttpServletResponse.SC_OK) {
+            Assert.assertEquals("OK", bc.toString());
+        }
+        return rc;
+    }
+
+
     private void registerDefaultProvider(Class<? extends ServerAuthModule> moduleClass) {
         Map<String,String> properties = new HashMap<>();
         properties.put(MODULE_KEY, moduleClass.getName());
@@ -128,6 +188,45 @@ public class TestAuthenticatorBaseJaspic extends TomcatBaseTest {
                 throws AuthException {
             // Fail without setting an HTTP status code
             throw new AuthException();
+        }
+    }
+
+
+    /*
+     * Validates the user name and password from the request headers with a
+     * PasswordValidationCallback, i.e. against the Realm of the Container
+     * associated with the CallbackHandler.
+     */
+    public static class TesterServerAuthModulePassword extends TesterServerAuthModuleBase {
+
+        public static final String USER_HEADER = "X-Test-User";
+        public static final String PASSWORD_HEADER = "X-Test-Password";
+
+        @Override
+        public AuthStatus validateRequest(MessageInfo messageInfo, Subject clientSubject, Subject serviceSubject)
+                throws AuthException {
+            HttpServletRequest request = (HttpServletRequest) messageInfo.getRequestMessage();
+            HttpServletResponse response = (HttpServletResponse) messageInfo.getResponseMessage();
+
+            String user = request.getHeader(USER_HEADER);
+            String password = request.getHeader(PASSWORD_HEADER);
+            if (user != null && password != null) {
+                PasswordValidationCallback pvc =
+                        new PasswordValidationCallback(clientSubject, user, password.toCharArray());
+                try {
+                    handler.handle(new Callback[] { pvc });
+                } catch (IOException | UnsupportedCallbackException e) {
+                    AuthException ae = new AuthException();
+                    ae.initCause(e);
+                    throw ae;
+                }
+                if (!clientSubject.getPrivateCredentials().isEmpty()) {
+                    return AuthStatus.SUCCESS;
+                }
+            }
+
+            response.setStatus(HttpServletResponse.SC_FORBIDDEN);
+            return AuthStatus.SEND_FAILURE;
         }
     }
 }

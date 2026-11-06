@@ -34,8 +34,6 @@ public class SimpleAuthConfigProvider implements AuthConfigProvider {
 
     private final Map<String,String> properties;
 
-    private volatile ServerAuthConfig serverAuthConfig;
-
     public SimpleAuthConfigProvider(Map<String,String> properties, AuthConfigFactory factory) {
         this.properties = properties;
         if (factory != null) {
@@ -60,16 +58,7 @@ public class SimpleAuthConfigProvider implements AuthConfigProvider {
     @Override
     public ServerAuthConfig getServerAuthConfig(String layer, String appContext,
             CallbackHandler handler) throws AuthException {
-        ServerAuthConfig serverAuthConfig = this.serverAuthConfig;
-        if (serverAuthConfig == null) {
-            synchronized (this) {
-                if (this.serverAuthConfig == null) {
-                    this.serverAuthConfig = createServerAuthConfig(layer, appContext, handler, properties);
-                }
-                serverAuthConfig = this.serverAuthConfig;
-            }
-        }
-        return serverAuthConfig;
+        return createServerAuthConfig(layer, appContext, handler, properties);
     }
 
 
@@ -81,9 +70,6 @@ public class SimpleAuthConfigProvider implements AuthConfigProvider {
 
     @Override
     public void refresh() {
-        ServerAuthConfig serverAuthConfig = this.serverAuthConfig;
-        if (serverAuthConfig != null) {
-            serverAuthConfig.refresh();
-        }
+        // NO-OP
     }
 }
